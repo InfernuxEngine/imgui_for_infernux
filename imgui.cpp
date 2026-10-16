@@ -5976,6 +5976,10 @@ static void AddWindowToSortBuffer(ImVector<ImGuiWindow*>* out_sorted_windows, Im
 static void AddWindowToDrawData(ImGuiWindow* window, int layer)
 {
     ImGuiContext& g = *GImGui;
+    // Keep docking geometry intact while rendering only the drag title.
+    if (g.DragDropActive && g.DragDropPayload.IsDataType(IMGUI_PAYLOAD_TYPE_WINDOW)
+        && window->RootWindowDockTree == *(ImGuiWindow**)g.DragDropPayload.Data)
+        return;
     ImGuiViewportP* viewport = window->Viewport;
     IM_ASSERT(viewport != NULL);
     g.IO.MetricsRenderWindows++;
@@ -21185,10 +21189,17 @@ void ImGui::BeginDockableDragDropSource(ImGuiWindow* window)
     window = window->RootWindowDockTree;
     IM_ASSERT((window->Flags & ImGuiWindowFlags_NoDocking) == 0);
     bool is_drag_docking = (g.IO.ConfigDockingWithShift) || ImRect(0, 0, window->SizeFull.x, GetFrameHeight()).Contains(g.ActiveIdClickOffset); // FIXME-DOCKING: Need to make this stateful and explicit
-    ImGuiDragDropFlags drag_drop_flags = ImGuiDragDropFlags_SourceNoPreviewTooltip | ImGuiDragDropFlags_SourceNoHoldToOpenOthers | ImGuiDragDropFlags_PayloadAutoExpire | ImGuiDragDropFlags_PayloadNoCrossContext | ImGuiDragDropFlags_PayloadNoCrossProcess;
+    ImGuiDragDropFlags drag_drop_flags = ImGuiDragDropFlags_SourceNoHoldToOpenOthers | ImGuiDragDropFlags_PayloadAutoExpire | ImGuiDragDropFlags_PayloadNoCrossContext | ImGuiDragDropFlags_PayloadNoCrossProcess;
     if (is_drag_docking && BeginDragDropSource(drag_drop_flags))
     {
         SetDragDropPayload(IMGUI_PAYLOAD_TYPE_WINDOW, &window, sizeof(window));
+        ImGuiWindow* title_window = g.MovingWindow;
+        if (window->DockNodeAsHost)
+            title_window = window->DockNodeAsHost->VisibleWindow;
+        if (title_window)
+            TextUnformatted(title_window->Name, FindRenderedTextEnd(title_window->Name));
+        else
+            TextUnformatted("Panels");
         EndDragDropSource();
         StoreDockStyleForWindow(window); // Store style overrides while dragging (even when not docked) because docking preview may need it.
     }
