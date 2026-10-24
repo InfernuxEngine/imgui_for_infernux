@@ -7168,6 +7168,7 @@ void ImGui::TreePop()
 {
     ImGuiContext& g = *GImGui;
     ImGuiWindow* window = g.CurrentWindow;
+    IM_ASSERT_USER_ERROR_RET(window->DC.TreeDepth > 0, "Calling TreePop() too many times!");
     Unindent();
 
     window->DC.TreeDepth--;
