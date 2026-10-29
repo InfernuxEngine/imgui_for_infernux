@@ -246,6 +246,8 @@ struct ImGui_ImplVulkan_FrameRenderBuffers
 {
     VkDeviceMemory      VertexBufferMemory;
     VkDeviceMemory      IndexBufferMemory;
+    void*               VertexBufferMapped;
+    void*               IndexBufferMapped;
     VkDeviceSize        VertexBufferSize;
     VkDeviceSize        IndexBufferSize;
     VkBuffer            VertexBuffer;
@@ -455,15 +457,20 @@ static bool ImGui_ImplVulkan_IsTextureLinearColor(ImGui_ImplVulkan_Data* bd, VkD
     return false;
 }
 
-static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory, VkDeviceSize& buffer_size, VkDeviceSize new_size, VkBufferUsageFlagBits usage)
+static void DestroyRenderBuffer(VkDevice device, VkBuffer& buffer, VkDeviceMemory& memory, VkDeviceSize& size, void*& mapped, const VkAllocationCallbacks* allocator)
+{
+    if (mapped) { vkUnmapMemory(device, memory); mapped = nullptr; }
+    if (buffer) { vkDestroyBuffer(device, buffer, allocator); buffer = VK_NULL_HANDLE; }
+    if (memory) { vkFreeMemory(device, memory, allocator); memory = VK_NULL_HANDLE; }
+    size = 0;
+}
+
+static bool CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory, VkDeviceSize& buffer_size, void*& mapped, VkDeviceSize new_size, VkBufferUsageFlagBits usage)
 {
     ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
     ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
     VkResult err;
-    if (buffer != VK_NULL_HANDLE)
-        vkDestroyBuffer(v->Device, buffer, v->Allocator);
-    if (buffer_memory != VK_NULL_HANDLE)
-        vkFreeMemory(v->Device, buffer_memory, v->Allocator);
+    DestroyRenderBuffer(v->Device, buffer, buffer_memory, buffer_size, mapped, v->Allocator);
 
     VkDeviceSize buffer_size_aligned = AlignBufferSize(IM_MAX(v->MinAllocationSize, new_size), bd->BufferMemoryAlignment);
     VkBufferCreateInfo buffer_info = {};
@@ -472,6 +479,12 @@ static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory
     buffer_info.usage = usage;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     err = vkCreateBuffer(v->Device, &buffer_info, v->Allocator, &buffer);
+    if (err != VK_SUCCESS)
+    {
+        buffer = VK_NULL_HANDLE;
+        check_vk_result(err);
+        return false;
+    }
     check_vk_result(err);
 
     VkMemoryRequirements req;
@@ -482,11 +495,36 @@ static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory
     alloc_info.allocationSize = req.size;
     alloc_info.memoryTypeIndex = ImGui_ImplVulkan_MemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, req.memoryTypeBits);
     err = vkAllocateMemory(v->Device, &alloc_info, v->Allocator, &buffer_memory);
+    if (err != VK_SUCCESS)
+    {
+        buffer_memory = VK_NULL_HANDLE;
+        DestroyRenderBuffer(v->Device, buffer, buffer_memory, buffer_size, mapped, v->Allocator);
+        check_vk_result(err);
+        return false;
+    }
     check_vk_result(err);
 
     err = vkBindBufferMemory(v->Device, buffer, buffer_memory, 0);
+    if (err != VK_SUCCESS)
+    {
+        DestroyRenderBuffer(v->Device, buffer, buffer_memory, buffer_size, mapped, v->Allocator);
+        check_vk_result(err);
+        return false;
+    }
+    check_vk_result(err);
+    // Keep the allocation base, not an upload cursor. Whole-allocation mapping
+    // also covers the existing VK_WHOLE_SIZE non-coherent flush below.
+    err = vkMapMemory(v->Device, buffer_memory, 0, VK_WHOLE_SIZE, 0, &mapped);
+    if (err != VK_SUCCESS)
+    {
+        mapped = nullptr;
+        DestroyRenderBuffer(v->Device, buffer, buffer_memory, buffer_size, mapped, v->Allocator);
+        check_vk_result(err);
+        return false;
+    }
     check_vk_result(err);
     buffer_size = buffer_size_aligned;
+    return true;
 }
 
 static void ImGui_ImplVulkan_SetupRenderState(ImDrawData* draw_data, VkPipeline pipeline, VkCommandBuffer command_buffer, ImGui_ImplVulkan_FrameRenderBuffers* rb, int fb_width, int fb_height)
@@ -574,18 +612,16 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
         // Create or resize the vertex/index buffers
         VkDeviceSize vertex_size = AlignBufferSize(draw_data->TotalVtxCount * sizeof(ImDrawVert), bd->BufferMemoryAlignment);
         VkDeviceSize index_size = AlignBufferSize(draw_data->TotalIdxCount * sizeof(ImDrawIdx), bd->BufferMemoryAlignment);
-        if (rb->VertexBuffer == VK_NULL_HANDLE || rb->VertexBufferSize < vertex_size)
-            CreateOrResizeBuffer(rb->VertexBuffer, rb->VertexBufferMemory, rb->VertexBufferSize, vertex_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        if (rb->IndexBuffer == VK_NULL_HANDLE || rb->IndexBufferSize < index_size)
-            CreateOrResizeBuffer(rb->IndexBuffer, rb->IndexBufferMemory, rb->IndexBufferSize, index_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        if ((rb->VertexBuffer == VK_NULL_HANDLE || rb->VertexBufferSize < vertex_size) &&
+            !CreateOrResizeBuffer(rb->VertexBuffer, rb->VertexBufferMemory, rb->VertexBufferSize, rb->VertexBufferMapped, vertex_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT))
+            return;
+        if ((rb->IndexBuffer == VK_NULL_HANDLE || rb->IndexBufferSize < index_size) &&
+            !CreateOrResizeBuffer(rb->IndexBuffer, rb->IndexBufferMemory, rb->IndexBufferSize, rb->IndexBufferMapped, index_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT))
+            return;
 
         // Upload vertex/index data into a single contiguous GPU buffer
-        ImDrawVert* vtx_dst = nullptr;
-        ImDrawIdx* idx_dst = nullptr;
-        VkResult err = vkMapMemory(v->Device, rb->VertexBufferMemory, 0, vertex_size, 0, (void**)&vtx_dst);
-        check_vk_result(err);
-        err = vkMapMemory(v->Device, rb->IndexBufferMemory, 0, index_size, 0, (void**)&idx_dst);
-        check_vk_result(err);
+        ImDrawVert* vtx_dst = (ImDrawVert*)rb->VertexBufferMapped;
+        ImDrawIdx* idx_dst = (ImDrawIdx*)rb->IndexBufferMapped;
         for (const ImDrawList* draw_list : draw_data->CmdLists)
         {
             memcpy(vtx_dst, draw_list->VtxBuffer.Data, draw_list->VtxBuffer.Size * sizeof(ImDrawVert));
@@ -600,10 +636,8 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
         range[1].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
         range[1].memory = rb->IndexBufferMemory;
         range[1].size = VK_WHOLE_SIZE;
-        err = vkFlushMappedMemoryRanges(v->Device, 2, range);
+        VkResult err = vkFlushMappedMemoryRanges(v->Device, 2, range);
         check_vk_result(err);
-        vkUnmapMemory(v->Device, rb->VertexBufferMemory);
-        vkUnmapMemory(v->Device, rb->IndexBufferMemory);
     }
 
     // Setup desired Vulkan state
@@ -1461,12 +1495,8 @@ void ImGui_ImplVulkan_RemoveTexture(VkDescriptorSet descriptor_set)
 
 void ImGui_ImplVulkan_DestroyFrameRenderBuffers(VkDevice device, ImGui_ImplVulkan_FrameRenderBuffers* buffers, const VkAllocationCallbacks* allocator)
 {
-    if (buffers->VertexBuffer) { vkDestroyBuffer(device, buffers->VertexBuffer, allocator); buffers->VertexBuffer = VK_NULL_HANDLE; }
-    if (buffers->VertexBufferMemory) { vkFreeMemory(device, buffers->VertexBufferMemory, allocator); buffers->VertexBufferMemory = VK_NULL_HANDLE; }
-    if (buffers->IndexBuffer) { vkDestroyBuffer(device, buffers->IndexBuffer, allocator); buffers->IndexBuffer = VK_NULL_HANDLE; }
-    if (buffers->IndexBufferMemory) { vkFreeMemory(device, buffers->IndexBufferMemory, allocator); buffers->IndexBufferMemory = VK_NULL_HANDLE; }
-    buffers->VertexBufferSize = 0;
-    buffers->IndexBufferSize = 0;
+    DestroyRenderBuffer(device, buffers->VertexBuffer, buffers->VertexBufferMemory, buffers->VertexBufferSize, buffers->VertexBufferMapped, allocator);
+    DestroyRenderBuffer(device, buffers->IndexBuffer, buffers->IndexBufferMemory, buffers->IndexBufferSize, buffers->IndexBufferMapped, allocator);
 }
 
 void ImGui_ImplVulkan_DestroyWindowRenderBuffers(VkDevice device, ImGui_ImplVulkan_WindowRenderBuffers* buffers, const VkAllocationCallbacks* allocator)
