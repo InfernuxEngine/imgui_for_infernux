@@ -110,6 +110,10 @@
 #ifndef IMGUI_DISABLE
 #include "imgui_impl_vulkan.h"
 #include <stdio.h>
+#include "ImGuiTextureOwnership.h"
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
 #ifndef IM_MAX
 #define IM_MAX(A, B)    (((A) >= (B)) ? (A) : (B))
 #endif
@@ -263,12 +267,19 @@ struct ImGui_ImplVulkan_WindowRenderBuffers
     ImVector<ImGui_ImplVulkan_FrameRenderBuffers> FrameRenderBuffers;
 };
 
+struct ImGui_ImplVulkan_AtlasOwners
+{
+    ImGuiTextureAllocationLease::Retire Retire;
+    std::unordered_map<VkDescriptorSet, std::weak_ptr<ImGuiTextureAllocationLease>> Sources;
+};
+
 struct ImGui_ImplVulkan_Texture
 {
     VkDeviceMemory              Memory;
     VkImage                     Image;
     VkImageView                 ImageView;
     VkDescriptorSet             DescriptorSet;
+    std::shared_ptr<ImGuiTextureAllocationLease>* Allocation;
 
     ImGui_ImplVulkan_Texture() { memset((void*)this, 0, sizeof(*this)); }
 };
@@ -308,6 +319,7 @@ struct ImGui_ImplVulkan_Data
     VkCommandPool               TexCommandPool;
     VkCommandBuffer             TexCommandBuffer;
     ImVector<VkDescriptorSet>   LinearColorTextures;
+    ImGui_ImplVulkan_AtlasOwners* AtlasOwners;
 
     // Render buffers for main window
     ImGui_ImplVulkan_WindowRenderBuffers MainWindowRenderBuffers;
@@ -341,6 +353,35 @@ static void ImGui_ImplVulkan_ShutdownMultiViewportSupport();
 static ImGui_ImplVulkan_Data* ImGui_ImplVulkan_GetBackendData()
 {
     return ImGui::GetCurrentContext() ? (ImGui_ImplVulkan_Data*)ImGui::GetIO().BackendRendererUserData : nullptr;
+}
+
+void ImGui_ImplVulkan_SetTextureRetirement(ImGuiTextureAllocationLease::Retire retire)
+{
+    auto* bd = ImGui_ImplVulkan_GetBackendData();
+    IM_ASSERT(bd && retire);
+    if (!bd->AtlasOwners)
+        bd->AtlasOwners = new ImGui_ImplVulkan_AtlasOwners();
+    bd->AtlasOwners->Retire = std::move(retire);
+}
+
+std::shared_ptr<ImGuiTextureAllocationLease> ImGui_ImplVulkan_AcquireAtlasAllocation(VkDescriptorSet descriptor)
+{
+    auto* bd = ImGui_ImplVulkan_GetBackendData();
+    if (!bd || !bd->AtlasOwners)
+        return {};
+    const auto found = bd->AtlasOwners->Sources.find(descriptor);
+    return found == bd->AtlasOwners->Sources.end() ? nullptr : found->second.lock();
+}
+
+void ImGui_ImplVulkan_ReleaseAtlasAllocations()
+{
+    auto* bd = ImGui_ImplVulkan_GetBackendData();
+    if (!bd || !bd->AtlasOwners)
+        return;
+    for (const auto& entry : bd->AtlasOwners->Sources)
+        if (const auto lease = entry.second.lock())
+            lease->Release();
+    bd->AtlasOwners->Sources.clear();
 }
 
 static uint32_t ImGui_ImplVulkan_MemoryType(VkMemoryPropertyFlags properties, uint32_t type_bits)
@@ -656,10 +697,17 @@ static void ImGui_ImplVulkan_DestroyTexture(ImTextureData* tex)
         IM_ASSERT(backend_tex->DescriptorSet == (VkDescriptorSet)tex->TexID);
         ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
         ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
-        ImGui_ImplVulkan_RemoveTexture(backend_tex->DescriptorSet);
-        vkDestroyImageView(v->Device, backend_tex->ImageView, v->Allocator);
-        vkDestroyImage(v->Device, backend_tex->Image, v->Allocator);
-        vkFreeMemory(v->Device, backend_tex->Memory, v->Allocator);
+        ImGui_ImplVulkan_SetTextureLinearColor(backend_tex->DescriptorSet, false);
+        if (backend_tex->Allocation)
+            delete backend_tex->Allocation; // Final owner retires the allocation.
+        else {
+            // Standalone backend users that never install engine retirement
+            // retain Dear ImGui's established explicit synchronization contract.
+            ImGui_ImplVulkan_RemoveTexture(backend_tex->DescriptorSet);
+            vkDestroyImageView(v->Device, backend_tex->ImageView, v->Allocator);
+            vkDestroyImage(v->Device, backend_tex->Image, v->Allocator);
+            vkFreeMemory(v->Device, backend_tex->Memory, v->Allocator);
+        }
         IM_DELETE(backend_tex);
 
         // Clear identifiers and mark as destroyed (in order to allow e.g. calling InvalidateDeviceObjects while running)
@@ -730,7 +778,42 @@ void ImGui_ImplVulkan_UpdateTexture(ImTextureData* tex)
         }
 
         // Create the Descriptor Set
-        backend_tex->DescriptorSet = ImGui_ImplVulkan_AddTexture(bd->TexSamplerLinear, backend_tex->ImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        VkSampler sampler = bd->TexSamplerLinear;
+        if (bd->AtlasOwners) {
+            VkSamplerCreateInfo info = {};
+            info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            info.magFilter = info.minFilter = VK_FILTER_LINEAR;
+            info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+            info.addressModeU = info.addressModeV = info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            info.minLod = -1000;
+            info.maxLod = 1000;
+            info.maxAnisotropy = 1.0f;
+            err = vkCreateSampler(v->Device, &info, v->Allocator, &sampler);
+            check_vk_result(err);
+        }
+        backend_tex->DescriptorSet = ImGui_ImplVulkan_AddTexture(sampler, backend_tex->ImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (bd->AtlasOwners) {
+            const auto device = v->Device;
+            const auto allocator = v->Allocator;
+            const auto pool = bd->DescriptorPool ? bd->DescriptorPool : v->DescriptorPool;
+            const auto descriptor = backend_tex->DescriptorSet;
+            const auto image = backend_tex->Image;
+            const auto view = backend_tex->ImageView;
+            const auto memory = backend_tex->Memory;
+            auto allocation = std::make_shared<ImGuiTextureAllocationLease>(bd->AtlasOwners->Retire,
+                [device, allocator, pool, descriptor, image, view, memory, sampler] {
+                    vkFreeDescriptorSets(device, pool, 1, &descriptor);
+                    vkDestroyImageView(device, view, allocator);
+                    vkDestroyImage(device, image, allocator);
+                    vkFreeMemory(device, memory, allocator);
+                    vkDestroySampler(device, sampler, allocator);
+                });
+            backend_tex->Allocation = new std::shared_ptr<ImGuiTextureAllocationLease>(allocation);
+            auto& sources = bd->AtlasOwners->Sources;
+            for (auto it = sources.begin(); it != sources.end(); )
+                if (it->second.expired()) it = sources.erase(it); else ++it;
+            sources[descriptor] = allocation;
+        }
 
         // Store identifiers
         tex->SetTexID((ImTextureID)backend_tex->DescriptorSet);
@@ -1314,6 +1397,7 @@ void ImGui_ImplVulkan_Shutdown()
     io.BackendRendererUserData = nullptr;
     io.BackendFlags &= ~(ImGuiBackendFlags_RendererHasVtxOffset | ImGuiBackendFlags_RendererHasTextures | ImGuiBackendFlags_RendererHasViewports);
     platform_io.ClearRendererHandlers();
+    delete bd->AtlasOwners;
     IM_DELETE(bd);
 }
 
